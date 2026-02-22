@@ -1,0 +1,28 @@
+{
+  "name": "@typescriptify/sweph",
+  "version": "1.0.0",
+  "description": "Swiss Ephemeris for TypeScript — high-precision astronomical calculations",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npx tsx --test tests/c-style/*.test.ts tests/modern/*.test.ts"
+  },
+  "keywords": [
+    "astronomy",
+    "astrology",
+    "ephemeris",
+    "swiss-ephemeris",
+    "planetary-positions",
+    "houses",
+    "eclipses",
+    "typescript"
+  ],
+  "author": "",
+  "license": "AGPL-3.0",
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3"
+  }
+}
