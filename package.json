@@ -1,6 +1,6 @@
 {
   "name": "@typescriptify/sweph",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Swiss Ephemeris for TypeScript — high-precision astronomical calculations",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -9,7 +9,11 @@
     "typecheck": "tsc --noEmit",
     "test": "npx tsx --test tests/c-style/*.test.ts tests/modern/*.test.ts"
   },
-  "keywords": [
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/typescriptify/sweph.git"
+    },
+    "keywords": [
     "astronomy",
     "astrology",
     "ephemeris",

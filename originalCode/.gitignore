@@ -1,5 +1,0 @@
-.vscode
-build
-node_modules
-src/functions.cpp
-package-lock.json
