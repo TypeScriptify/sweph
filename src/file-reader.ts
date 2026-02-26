@@ -38,11 +38,22 @@ export class SE1FileReader {
   }
 
   seekSet(offset: number): void {
+    if (!Number.isFinite(offset) || offset < 0) {
+      throw new RangeError(
+        `seekSet: invalid offset ${offset} (buffer length ${this.view.byteLength})`,
+      );
+    }
     this.pos = offset;
   }
 
   seekCur(offset: number): void {
-    this.pos += offset;
+    const newPos = this.pos + offset;
+    if (!Number.isFinite(newPos) || newPos < 0) {
+      throw new RangeError(
+        `seekCur: invalid resulting position ${newPos} (buffer length ${this.view.byteLength})`,
+      );
+    }
+    this.pos = newPos;
   }
 
   readInt32(): number {

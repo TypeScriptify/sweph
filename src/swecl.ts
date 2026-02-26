@@ -496,7 +496,7 @@ function sweRiseTransTrueHor(
       if (doFixstar) dd = 0;
       else if (rsmiAdj & SE_BIT_DISC_CENTER) dd = 0;
       else if (iplAdj < NDIAM) dd = PLA_DIAM[iplAdj];
-      else if (iplAdj > SE_AST_OFFSET) dd = 0; // simplified: no ast_diam
+      else if (iplAdj > SE_AST_OFFSET) dd = swed.astDiam * 1000; // km → m
       else dd = 0;
     }
 

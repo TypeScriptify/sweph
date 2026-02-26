@@ -1,0 +1,11 @@
+src/
+tests/
+ephe/
+sweph-source/
+originalCode/
+Questions.md
+tsconfig.json
+tsconfig.build.json
+.DS_Store
+.idea/
+*.tsbuildinfo

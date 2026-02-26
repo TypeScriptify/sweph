@@ -2,6 +2,8 @@
  * Shared test helpers, constants, and assertions.
  */
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 /** Assert that `a` is within `tol` of `b`. */
 export function near(a: number, b: number, tol: number): void {
@@ -19,3 +21,9 @@ export const LONDON = { longitude: -0.1278, latitude: 51.5074, altitude: 0 };
 
 /** London as [lon, lat, alt] array for C-style functions */
 export const LONDON_ARR: [number, number, number] = [-0.1278, 51.5074, 0];
+
+/** Load an ephemeris file from the ephe/ directory as an ArrayBuffer. */
+export function loadEpheFile(name: string): ArrayBuffer {
+  const buf = readFileSync(resolve(process.cwd(), 'ephe', name));
+  return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+}

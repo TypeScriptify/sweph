@@ -82,7 +82,9 @@ import {
   SE_TIDAL_DE406, SE_TIDAL_DE421, SE_TIDAL_DE422, SE_TIDAL_DE430,
   SE_TIDAL_DE431, SE_TIDAL_DE441,
   SE_DE_NUMBER,
-  SEMOD_PREC_NEWCOMB,
+  SEMOD_PREC_NEWCOMB, SEMOD_PREC_IAU_1976,
+  SEMOD_NUT_WOOLARD, SEMOD_NUT_IAU_1980,
+  SE_MODEL_PREC_LONGTERM, SE_MODEL_PREC_SHORTTERM, SE_MODEL_NUT,
   AYANAMSA, AyaInit,
   PLA_DIAM,
   AS_MAXCH,
@@ -985,6 +987,8 @@ function appPosRest(
   swed: SweData,
 ): number {
   let serr = '';
+  /* Save J2000 equatorial for sidereal ECL_T0/SSY_PLANE conversion */
+  const xxJ2000 = [xx[0], xx[1], xx[2], xx[3], xx[4], xx[5]];
   /* For SEFLG_SPEED flag, we always compute speed (already done) */
   /* ---- If J2000 requested, skip precession/nutation ---- */
   if ((iflag & SEFLG_J2000) === 0 && (iflag & SEFLG_ICRS) === 0) {
@@ -1015,14 +1019,25 @@ function appPosRest(
   }
   /* Save ecliptic cartesian */
   for (let i = 0; i <= 5; i++) xxSaved[i + 6] = xx[i];
-  /* ---- Convert to polar if not XYZ ---- */
-  /* ecliptic polar */
-  swiCartpolSp(xx, xxSaved);
-  /* equatorial cartesian already saved at offset 18 */
-  /* equatorial polar */
-  const xeq = [xxSaved[18], xxSaved[19], xxSaved[20], xxSaved[21], xxSaved[22], xxSaved[23]];
-  swiCartpolSp(xeq, new Float64Array(6));
-  /* Re-compute equatorial polar from the saved equatorial cartesian */
+  /* ---- Sidereal conversion for ECL_T0 and SSY_PLANE ---- */
+  if ((iflag & SEFLG_SIDEREAL) !== 0 &&
+      (swed.sidd.sidMode & (SE_SIDBIT_ECL_T0 | SE_SIDBIT_SSY_PLANE)) !== 0) {
+    if (swed.sidd.sidMode & SE_SIDBIT_ECL_T0) {
+      const tmpEcl = [0, 0, 0, 0, 0, 0];
+      const tmpEqu = [0, 0, 0, 0, 0, 0];
+      swiTropRa2SidLon(xxJ2000, tmpEcl, tmpEqu, iflag, swed);
+      for (let i = 0; i <= 5; i++) { xxSaved[6 + i] = tmpEcl[i]; xxSaved[18 + i] = tmpEqu[i]; }
+    } else if (swed.sidd.sidMode & SE_SIDBIT_SSY_PLANE) {
+      const tmpEcl = [0, 0, 0, 0, 0, 0];
+      swiTropRa2SidLonSosy(xxJ2000, tmpEcl, iflag, swed);
+      for (let i = 0; i <= 5; i++) xxSaved[6 + i] = tmpEcl[i];
+    }
+  }
+  /* ---- Convert to polar ---- */
+  /* ecliptic polar from ecliptic cartesian */
+  const eclArr = [xxSaved[6], xxSaved[7], xxSaved[8], xxSaved[9], xxSaved[10], xxSaved[11]];
+  swiCartpolSp(eclArr, xxSaved);
+  /* equatorial polar from equatorial cartesian */
   const xeqPol = new Float64Array(6);
   swiCartpolSp(
     [xxSaved[18], xxSaved[19], xxSaved[20], xxSaved[21], xxSaved[22], xxSaved[23]],
@@ -1614,7 +1629,13 @@ function swePlanInt(
   const epheflag = iflag & SEFLG_EPHMASK;
   /* ---- SWIEPH path ---- */
   if (epheflag === SEFLG_SWIEPH) {
-    const rc = sweplanSwieph(swed, tjd, ipli, SEI_FILE_PLANET, iflag,
+    let ifno = SEI_FILE_PLANET;
+    if (ipli === SEI_CHIRON || ipli === SEI_PHOLUS
+      || ipli === SEI_CERES || ipli === SEI_PALLAS
+      || ipli === SEI_JUNO || ipli === SEI_VESTA) {
+      ifno = SEI_FILE_MAIN_AST;
+    }
+    const rc = sweplanSwieph(swed, tjd, ipli, ifno, iflag,
       doSave, xpret, xeret, xsret, null);
     if (rc.retc === OK) return rc;
     if (rc.retc === ERR) return rc;
@@ -1642,111 +1663,290 @@ function swePlanInt(
  * Part 5: sweCalc, sweCalcUt, sweCalcInt, lunarOscElem, etc.
  * ================================================================ */
 
-/** Compute osculating elements for Moon nodes/apsides */
+/**
+ * Compute osculating elements for Moon nodes/apsides.
+ * Ported from C's lunar_osc_elem() (sweph.c:5167-5593).
+ * Computes true node and osculating apogee from 3 lunar positions.
+ * Fills ndp.xreturn directly (caller should NOT call appPosRest).
+ */
 function lunarOscElem(
   tjd: number, ipl: number, iflag: number, swed: SweData,
 ): { retc: number; serr: string } {
   let serr = '';
-  const ipli = SEI_OSCU_APOG; /* for both true node and osc apogee */
-  const pdp = (ipl === SE_TRUE_NODE) ? swed.nddat[SEI_TRUE_NODE] : swed.nddat[SEI_OSCU_APOG];
-  /* We need the Moon first */
-  const moonRes = sweMoonInt(tjd, iflag, swed);
-  if (moonRes.retc === ERR) return moonRes;
-  const pdpMoon = swed.pldat[SEI_MOON];
-  /* For true node: compute osculating orbital elements from moon position+speed */
-  /* Get moon geocentric position */
-  const pedp = swed.pldat[SEI_EARTH];
-  const xm = new Float64Array(6);
-  for (let i = 0; i <= 5; i++) xm[i] = pdpMoon.x[i] - pedp.x[i];
-  /* Convert to ecliptic of date */
-  swiCoortrf2(xm, xm, swed.oec.seps, swed.oec.ceps);
-  swiCoortrf2(xm, xm, swed.oec.seps, swed.oec.ceps, 3, 3);
-  /* Compute osculating elements */
-  swiCartpol(xm, xm);
-  /* Node longitude (simplified: ascending node ≈ lon - 180 when lat=0 crossing) */
-  /* This is a significant simplification. For better accuracy, we'd need
-     the full orbital element computation. For now, use mean elements as fallback. */
-  if (ipl === SE_TRUE_NODE) {
-    /* Compute true node using 3 positions and interpolation */
-    const speed_intv = NODE_CALC_INTV_MOSH;
-    const xpos = [new Float64Array(6), new Float64Array(6), new Float64Array(6)];
-    const xnorm = [0, 0, 0, 0, 0, 0];
-    const xx = [0, 0, 0, 0, 0, 0];
-    /* Compute moon at 3 times */
-    for (let ipos = 0; ipos < 3; ipos++) {
-      const t = tjd + (ipos - 1) * speed_intv;
-      if (ipos === 1) {
-        /* Use already computed moon */
-        for (let i = 0; i <= 5; i++) xpos[ipos][i] = pdpMoon.x[i] - pedp.x[i];
-      } else {
-        /* Compute moon at offset time */
-        const xxm = new Float64Array(6);
-        swiMoshmoon(swed, t, NO_SAVE, xxm);
-        /* Also need earth at that time */
-        const xxe = new Float64Array(6);
-        swiMoshplan(swed, t, SEI_EARTH, NO_SAVE, null, xxe);
-        for (let i = 0; i <= 5; i++) xpos[ipos][i] = xxm[i] - xxe[i];
+  const oe = swed.oec;
+  const ndp = (ipl === SE_TRUE_NODE) ? swed.nddat[SEI_TRUE_NODE] : swed.nddat[SEI_OSCU_APOG];
+  /* Cache check: if already computed for this date/flags, return */
+  const flg1 = iflag & ~SEFLG_EQUATORIAL & ~SEFLG_XYZ;
+  const flg2 = ndp.xflgs & ~SEFLG_EQUATORIAL & ~SEFLG_XYZ;
+  const speedf1 = ndp.xflgs & SEFLG_SPEED;
+  const speedf2 = iflag & SEFLG_SPEED;
+  if (tjd === ndp.teval && tjd !== 0 && flg1 === flg2 && (!speedf2 || speedf1)) {
+    ndp.xflgs = iflag;
+    ndp.iephe = iflag & SEFLG_EPHMASK;
+    return { retc: OK, serr };
+  }
+  const speed_intv = NODE_CALC_INTV_MOSH;
+  const istart = (iflag & SEFLG_SPEED) ? 0 : 2;
+  /*
+   * Compute moon at 3 times (t-dt, t+dt, t), transform each to ecliptic of date.
+   * xpos[i] will be geocentric ecliptic of date with speed.
+   */
+  const xpos: Float64Array[] = [new Float64Array(6), new Float64Array(6), new Float64Array(6)];
+  for (let i = istart; i <= 2; i++) {
+    let t: number;
+    if (i === 0) t = tjd - speed_intv;
+    else if (i === 1) t = tjd + speed_intv;
+    else t = tjd;
+    const retc = swiMoshmoon(swed, t, NO_SAVE, xpos[i]);
+    if (retc === ERR) return { retc: ERR, serr: 'error computing Moshier moon' };
+    /* Apply swi_plan_for_osc_elem equivalent: equatorial J2000 → ecliptic of date */
+    planForOscElemTransform(xpos[i], t, iflag | SEFLG_SPEED, swed);
+  }
+  /*
+   * Node computation: project moon position onto ecliptic plane.
+   * The node is where the tangent of the lunar motion pierces the ecliptic (z=0).
+   * Formula: fac = z/z_dot, node_j = (pos_j - fac * speed_j) * sgn(z_dot)
+   */
+  const xx: number[][] = [[0,0,0], [0,0,0], [0,0,0]];
+  const ndnp = swed.nddat[SEI_TRUE_NODE];
+  for (let i = istart; i <= 2; i++) {
+    if (Math.abs(xpos[i][5]) < 1e-15) xpos[i][5] = 1e-15;
+    const fac = xpos[i][2] / xpos[i][5];
+    const sgn = xpos[i][5] / Math.abs(xpos[i][5]);
+    for (let j = 0; j <= 2; j++) {
+      xx[i][j] = (xpos[i][j] - fac * xpos[i][j + 3]) * sgn;
+    }
+  }
+  /* Save node position + speed (quadratic interpolation) */
+  for (let i = 0; i <= 2; i++) {
+    ndnp.x[i] = xx[2][i];
+    if (iflag & SEFLG_SPEED) {
+      const b = (xx[1][i] - xx[0][i]) / 2;
+      const a = (xx[1][i] + xx[0][i]) / 2 - xx[2][i];
+      ndnp.x[i + 3] = (2 * a + b) / speed_intv;
+    } else {
+      ndnp.x[i + 3] = 0;
+    }
+  }
+  ndnp.teval = tjd;
+  ndnp.iephe = SEFLG_MOSEPH;
+  /*
+   * Osculating apogee: compute from orbital elements.
+   * Must be computed even if only node is wanted (it corrects node distance).
+   */
+  const ndap = swed.nddat[SEI_OSCU_APOG];
+  const Gmsm = GEOGCONST * (1 + 1 / EARTH_MOON_MRAT) / AUNIT / AUNIT / AUNIT * 86400.0 * 86400.0;
+  const xxa: number[][] = [[0,0,0], [0,0,0], [0,0,0]];
+  const xnorm = [0, 0, 0];
+  const r = [0, 0];
+  for (let i = istart; i <= 2; i++) {
+    /* Node direction in ecliptic */
+    const rxy = Math.sqrt(xx[i][0] * xx[i][0] + xx[i][1] * xx[i][1]);
+    const cosnode = xx[i][0] / rxy;
+    const sinnode = xx[i][1] / rxy;
+    /* Inclination from angular momentum vector h = r × v */
+    const xnormArr = new Float64Array(3);
+    swiCrossProd(xpos[i].subarray(0, 3), xpos[i].subarray(3, 6), xnormArr);
+    xnorm[0] = xnormArr[0]; xnorm[1] = xnormArr[1]; xnorm[2] = xnormArr[2];
+    const c2 = xnorm[0] * xnorm[0] + xnorm[1] * xnorm[1] + xnorm[2] * xnorm[2];
+    const rxyz_n = Math.sqrt(c2);
+    const rxy_n = Math.sqrt(xnorm[0] * xnorm[0] + xnorm[1] * xnorm[1]);
+    const sinincl = rxy_n / rxyz_n;
+    const cosincl = Math.sqrt(1 - sinincl * sinincl);
+    /* Argument of latitude */
+    const cosu = xpos[i][0] * cosnode + xpos[i][1] * sinnode;
+    const sinu = xpos[i][2] / sinincl;
+    const uu = Math.atan2(sinu, cosu);
+    /* Semi-major axis */
+    const rxyz = Math.sqrt(squareSum(xpos[i]));
+    const v2 = squareSum(xpos[i], 3);
+    const sema = 1 / (2 / rxyz - v2 / Gmsm);
+    /* Eccentricity */
+    const pp = c2 / Gmsm;
+    const ecce = Math.sqrt(1 - pp / sema);
+    /* Eccentric anomaly */
+    const cosE1 = (1 / ecce) * (1 - rxyz / sema);
+    const sinE1 = (1 / ecce / Math.sqrt(sema * Gmsm)) *
+      (xpos[i][0] * xpos[i][3] + xpos[i][1] * xpos[i][4] + xpos[i][2] * xpos[i][5]);
+    /* True anomaly */
+    const ny1 = 2 * Math.atan(Math.sqrt((1 + ecce) / (1 - ecce)) * sinE1 / (1 + cosE1));
+    /* Apogee: distance from ascending node */
+    xxa[i][0] = swiMod2PI(uu - ny1 + Math.PI);
+    xxa[i][1] = 0; /* latitude */
+    xxa[i][2] = sema * (1 + ecce); /* distance */
+    /* Transform to ecliptic coordinates */
+    swiPolcart(xxa[i], xxa[i]);
+    swiCoortrf2(xxa[i], xxa[i], -sinincl, cosincl);
+    swiCartpol(xxa[i], xxa[i]);
+    /* Add node longitude to get apogee in ecliptic */
+    xxa[i][0] += Math.atan2(sinnode, cosnode);
+    swiPolcart(xxa[i], xxa[i]);
+    /* Correct node distance from orbital ellipse */
+    const ny2 = swiMod2PI(ny1 - uu);
+    const cosE2 = Math.cos(2 * Math.atan(Math.tan(ny2 / 2) / Math.sqrt((1 + ecce) / (1 - ecce))));
+    r[0] = sema * (1 - ecce * cosE2);
+    r[1] = Math.sqrt(xx[i][0] * xx[i][0] + xx[i][1] * xx[i][1] + xx[i][2] * xx[i][2]);
+    if (r[1] > 0) {
+      for (let j = 0; j <= 2; j++) xx[i][j] *= r[0] / r[1];
+    }
+  }
+  /* Save apogee position + speed */
+  for (let i = 0; i <= 2; i++) {
+    ndap.x[i] = xxa[2][i];
+    if (iflag & SEFLG_SPEED) {
+      ndap.x[i + 3] = (xxa[1][i] - xxa[0][i]) / speed_intv / 2;
+    } else {
+      ndap.x[i + 3] = 0;
+    }
+    /* Also update node with corrected distance */
+    ndnp.x[i] = xx[2][i];
+    if (iflag & SEFLG_SPEED) {
+      ndnp.x[i + 3] = (xx[1][i] - xx[0][i]) / speed_intv / 2;
+    } else {
+      ndnp.x[i + 3] = 0;
+    }
+  }
+  ndap.teval = tjd;
+  ndap.iephe = SEFLG_MOSEPH;
+  /*
+   * Fill xreturn for both node and apogee.
+   * Precession and nutation are already applied (via planForOscElemTransform).
+   */
+  const tmpSp = [0, 0, 0, 0, 0, 0];
+  for (let j = 0; j <= 1; j++) {
+    const ndpJ = (j === 0) ? swed.nddat[SEI_TRUE_NODE] : swed.nddat[SEI_OSCU_APOG];
+    for (let i = 0; i < 24; i++) ndpJ.xreturn[i] = 0;
+    /* Cartesian ecliptic */
+    for (let i = 0; i <= 5; i++) ndpJ.xreturn[6 + i] = ndpJ.x[i];
+    /* Polar ecliptic (from cartesian ecliptic) */
+    for (let i = 0; i <= 5; i++) tmpSp[i] = ndpJ.xreturn[6 + i];
+    swiCartpolSp(tmpSp, tmpSp);
+    for (let i = 0; i <= 5; i++) ndpJ.xreturn[i] = tmpSp[i];
+    /* Cartesian equatorial (ecliptic → equatorial) */
+    swiCoortrf2(ndpJ.xreturn, ndpJ.xreturn, -oe.seps, oe.ceps, 6, 18);
+    if (iflag & SEFLG_SPEED) {
+      swiCoortrf2(ndpJ.xreturn, ndpJ.xreturn, -oe.seps, oe.ceps, 9, 21);
+    }
+    /* Nutation: equatorial mean → equatorial true */
+    if (!(iflag & SEFLG_NONUT)) {
+      swiCoortrf2(ndpJ.xreturn, ndpJ.xreturn, -swed.nut.snut, swed.nut.cnut, 18, 18);
+      if (iflag & SEFLG_SPEED) {
+        swiCoortrf2(ndpJ.xreturn, ndpJ.xreturn, -swed.nut.snut, swed.nut.cnut, 21, 21);
       }
     }
-    /* Compute the ascending node from the cross product of position vectors */
-    /* Cross product of positions at t-dt and t+dt gives normal to orbital plane */
-    swiCrossProd(xpos[0], xpos[2], new Float64Array(6));
-    /* Node = cross product of orbital plane normal with ecliptic normal */
-    /* The ecliptic normal in equatorial J2000 coords is (0, -sin(eps), cos(eps)) */
-    const eclNorm = [0, -swed.oec2000.seps, swed.oec2000.ceps];
-    const orbNorm = new Float64Array(6);
-    swiCrossProd(xpos[0], xpos[2], orbNorm);
-    /* Node direction = eclNorm x orbNorm */
-    const nodeVec = new Float64Array(6);
-    swiCrossProd(
-      new Float64Array([eclNorm[0], eclNorm[1], eclNorm[2]]),
-      orbNorm,
-      nodeVec,
-    );
-    const rNode = Math.sqrt(squareSum(nodeVec));
-    if (rNode > 0) {
-      for (let i = 0; i <= 2; i++) nodeVec[i] /= rNode;
+    /* Polar equatorial (from cartesian equatorial) */
+    for (let i = 0; i <= 5; i++) tmpSp[i] = ndpJ.xreturn[18 + i];
+    swiCartpolSp(tmpSp, tmpSp);
+    for (let i = 0; i <= 5; i++) ndpJ.xreturn[12 + i] = tmpSp[i];
+    ndpJ.xflgs = iflag;
+    ndpJ.iephe = iflag & SEFLG_EPHMASK;
+    /* Sidereal */
+    if (iflag & SEFLG_SIDEREAL) {
+      if ((swed.sidd.sidMode & SE_SIDBIT_ECL_T0) || (swed.sidd.sidMode & SE_SIDBIT_SSY_PLANE)) {
+        const xSid = [0, 0, 0, 0, 0, 0];
+        for (let i = 0; i <= 5; i++) xSid[i] = ndpJ.xreturn[18 + i];
+        /* Remove nutation */
+        if (!(iflag & SEFLG_NONUT)) swiNutate(xSid, iflag, true, swed);
+        /* Precess to J2000 */
+        swiPrecess(xSid, tjd, iflag, J_TO_J2000, swed);
+        if (iflag & SEFLG_SPEED) {
+          const xSpd = [xSid[3], xSid[4], xSid[5]];
+          swiPrecess(xSpd, tjd, iflag, J_TO_J2000, swed);
+          xSid[3] = xSpd[0]; xSid[4] = xSpd[1]; xSid[5] = xSpd[2];
+        }
+        if (swed.sidd.sidMode & SE_SIDBIT_ECL_T0) {
+          const tmpEcl = [0, 0, 0, 0, 0, 0];
+          const tmpEqu = [0, 0, 0, 0, 0, 0];
+          swiTropRa2SidLon(xSid, tmpEcl, tmpEqu, iflag, swed);
+          for (let i = 0; i <= 5; i++) { ndpJ.xreturn[6 + i] = tmpEcl[i]; ndpJ.xreturn[18 + i] = tmpEqu[i]; }
+        } else if (swed.sidd.sidMode & SE_SIDBIT_SSY_PLANE) {
+          const tmpEcl = [0, 0, 0, 0, 0, 0];
+          swiTropRa2SidLonSosy(xSid, tmpEcl, iflag, swed);
+          for (let i = 0; i <= 5; i++) ndpJ.xreturn[6 + i] = tmpEcl[i];
+        }
+        for (let i = 0; i <= 5; i++) tmpSp[i] = ndpJ.xreturn[6 + i];
+        swiCartpolSp(tmpSp, tmpSp);
+        for (let i = 0; i <= 5; i++) ndpJ.xreturn[i] = tmpSp[i];
+        for (let i = 0; i <= 5; i++) tmpSp[i] = ndpJ.xreturn[18 + i];
+        swiCartpolSp(tmpSp, tmpSp);
+        for (let i = 0; i <= 5; i++) ndpJ.xreturn[12 + i] = tmpSp[i];
+      } else {
+        /* Default sidereal: subtract ayanamsa */
+        for (let i = 0; i <= 5; i++) tmpSp[i] = ndpJ.xreturn[6 + i];
+        swiCartpolSp(tmpSp, tmpSp);
+        for (let i = 0; i <= 5; i++) ndpJ.xreturn[i] = tmpSp[i];
+        const ayaRes = swiGetAyanamsaEx(swed, ndpJ.teval, iflag);
+        if (ayaRes.retc === ERR) return { retc: ERR, serr: ayaRes.serr };
+        ndpJ.xreturn[0] -= ayaRes.daya * DEGTORAD;
+        for (let i = 0; i <= 5; i++) tmpSp[i] = ndpJ.xreturn[i];
+        swiPolcartSp(tmpSp, tmpSp);
+        for (let i = 0; i <= 5; i++) ndpJ.xreturn[6 + i] = tmpSp[i];
+      }
     }
-    /* Convert to polar */
-    swiCartpol(nodeVec, nodeVec);
-    /* Set distance to mean distance */
-    const ndp = swed.nddat[SEI_TRUE_NODE];
-    ndp.x[0] = nodeVec[0];
-    ndp.x[1] = 0;
-    ndp.x[2] = pdpMoon.x[2]; /* approximate distance */
-    /* Convert back to cartesian equatorial J2000 for storage */
-    swiPolcart(ndp.x, ndp.x);
-    /* Speed: difference of two nodes */
-    const xpos2 = [new Float64Array(6), new Float64Array(6), new Float64Array(6)];
-    /* Simplified: compute speed from finite difference */
-    ndp.x[3] = 0;
-    ndp.x[4] = 0;
-    ndp.x[5] = 0;
-    ndp.teval = tjd;
-    ndp.iephe = SEFLG_MOSEPH;
-    return { retc: OK, serr };
-  }
-  /* Osculating apogee */
-  if (ipl === SE_OSCU_APOG) {
-    /* Simplified: use mean apogee as approximation */
-    const pol = new Float64Array(6);
-    const serrArr: string[] = [''];
-    const retc = swiMeanApog(tjd, pol, serrArr);
-    if (retc === ERR) return { retc: ERR, serr: serrArr[0] };
-    const ndp = swed.nddat[SEI_OSCU_APOG];
-    /* pol is in ecliptic of date, convert to equatorial J2000 */
-    swiPolcart(pol, pol);
-    swiCoortrf(pol, pol, -swed.oec.eps);
-    swiPrecess(pol, tjd, iflag, J_TO_J2000, swed);
-    for (let i = 0; i <= 2; i++) ndp.x[i] = pol[i];
-    ndp.x[3] = 0;
-    ndp.x[4] = 0;
-    ndp.x[5] = 0;
-    ndp.teval = tjd;
-    ndp.iephe = SEFLG_MOSEPH;
-    return { retc: OK, serr };
+    /* NOTE: xreturn stays in radians; sweCalc handles degree conversion */
   }
   return { retc: OK, serr };
+}
+
+/**
+ * Transform position from equatorial J2000 to ecliptic of date.
+ * Equivalent of C's swi_plan_for_osc_elem() for the Moshier path.
+ * Applies: precession → nutation rotation → equatorial→ecliptic → ecliptic nutation.
+ */
+function planForOscElemTransform(
+  xx: Float64Array, tjd: number, iflag: number, swed: SweData,
+): void {
+  /* Precession: equatorial J2000 → equatorial of date */
+  swiPrecess(xx, tjd, iflag, J2000_TO_J, swed);
+  const xspd = [xx[3], xx[4], xx[5]];
+  swiPrecess(xspd, tjd, iflag, J2000_TO_J, swed);
+  xx[3] = xspd[0]; xx[4] = xspd[1]; xx[5] = xspd[2];
+  /* Obliquity at date */
+  let oeTmp: Epsilon;
+  if (tjd === swed.oec.teps) {
+    oeTmp = swed.oec;
+  } else if (tjd === J2000) {
+    oeTmp = swed.oec2000;
+  } else {
+    oeTmp = createEpsilon();
+    calcEpsilon(tjd, iflag, oeTmp, swed);
+  }
+  /* Nutation in equatorial coords (matrix rotation, rotation only — no nutation speed added) */
+  if (!(iflag & SEFLG_NONUT)) {
+    let nutp: Nut;
+    if (tjd === swed.nut.tnut) {
+      nutp = swed.nut;
+    } else if (tjd === J2000) {
+      nutp = swed.nut2000;
+    } else if (tjd === swed.nutv.tnut) {
+      nutp = swed.nutv;
+    } else {
+      nutp = createNut();
+      swiNutation(tjd, iflag, nutp.nutlo, swed);
+      nutp.tnut = tjd;
+      nutp.snut = Math.sin(nutp.nutlo[1]);
+      nutp.cnut = Math.cos(nutp.nutlo[1]);
+      nutMatrix(nutp, oeTmp);
+    }
+    const x = [0, 0, 0, 0, 0, 0];
+    for (let i = 0; i <= 2; i++) {
+      x[i] = xx[0] * nutp.matrix[0][i] + xx[1] * nutp.matrix[1][i] + xx[2] * nutp.matrix[2][i];
+    }
+    for (let i = 0; i <= 2; i++) {
+      x[i + 3] = xx[3] * nutp.matrix[0][i] + xx[4] * nutp.matrix[1][i] + xx[5] * nutp.matrix[2][i];
+    }
+    for (let i = 0; i <= 5; i++) xx[i] = x[i];
+    /* Equatorial → ecliptic */
+    swiCoortrf2(xx, xx, oeTmp.seps, oeTmp.ceps);
+    swiCoortrf2(xx, xx, oeTmp.seps, oeTmp.ceps, 3, 3);
+    /* Ecliptic nutation */
+    swiCoortrf2(xx, xx, nutp.snut, nutp.cnut);
+    swiCoortrf2(xx, xx, nutp.snut, nutp.cnut, 3, 3);
+  } else {
+    /* No nutation: just equatorial → ecliptic */
+    swiCoortrf2(xx, xx, oeTmp.seps, oeTmp.ceps);
+    swiCoortrf2(xx, xx, oeTmp.seps, oeTmp.ceps, 3, 3);
+  }
 }
 
 /** Plan for osculating elements (fictitious planets) */
@@ -1984,18 +2184,12 @@ function sweCalcInt(
     if (earthRes.retc === ERR) {
       return { flags: ERR, xx, serr: earthRes.serr };
     }
-    const moonRes2 = sweMoonInt(tjdEt, iflag, swed);
-    if (moonRes2.retc === ERR) {
-      return { flags: ERR, xx, serr: moonRes2.serr };
-    }
+    /* lunarOscElem fills xreturn directly (no appPosRest needed) */
     const oscRes = lunarOscElem(tjdEt, ipl, iflag, swed);
     if (oscRes.retc === ERR) {
       return { flags: ERR, xx, serr: oscRes.serr };
     }
     const ndp = swed.nddat[SEI_TRUE_NODE];
-    const xxTemp = new Float64Array(6);
-    for (let i = 0; i <= 5; i++) xxTemp[i] = ndp.x[i];
-    retc = appPosRest(ndp, iflag, xxTemp, ndp.xreturn, swed);
     for (let i = 0; i <= 23; i++) xx[i] = ndp.xreturn[i];
     return { flags: iflgRet, xx, serr };
   }
@@ -2043,18 +2237,12 @@ function sweCalcInt(
     if (earthRes.retc === ERR) {
       return { flags: ERR, xx, serr: earthRes.serr };
     }
-    const moonRes3 = sweMoonInt(tjdEt, iflag, swed);
-    if (moonRes3.retc === ERR) {
-      return { flags: ERR, xx, serr: moonRes3.serr };
-    }
+    /* lunarOscElem fills xreturn directly (no appPosRest needed) */
     const oscRes = lunarOscElem(tjdEt, ipl, iflag, swed);
     if (oscRes.retc === ERR) {
       return { flags: ERR, xx, serr: oscRes.serr };
     }
     const ndp = swed.nddat[SEI_OSCU_APOG];
-    const xxTemp = new Float64Array(6);
-    for (let i = 0; i <= 5; i++) xxTemp[i] = ndp.x[i];
-    retc = appPosRest(ndp, iflag, xxTemp, ndp.xreturn, swed);
     for (let i = 0; i <= 23; i++) xx[i] = ndp.xreturn[i];
     return { flags: iflgRet, xx, serr };
   }
@@ -2150,8 +2338,9 @@ export function sweCalc(
       }
     }
   }
-  /* Apply sidereal correction */
-  if (result.flags !== ERR && (iflag & SEFLG_SIDEREAL) !== 0 && ipl !== SE_ECL_NUT) {
+  /* Apply sidereal correction (default mode only; ECL_T0/SSY_PLANE handled in appPosRest) */
+  if (result.flags !== ERR && (iflag & SEFLG_SIDEREAL) !== 0 && ipl !== SE_ECL_NUT &&
+      !(swed.sidd.sidMode & (SE_SIDBIT_ECL_T0 | SE_SIDBIT_SSY_PLANE))) {
     const ayaRes = swiGetAyanamsaEx(swed, tjdEt, iflag);
     if (ayaRes.retc === ERR) {
       return { flags: ERR, xx: xxOut, serr: ayaRes.serr };
@@ -2185,19 +2374,61 @@ export function sweCalcUt(
 /** Set sidereal mode */
 export function sweSetSidMode(swed: SweData, sidMode: number, t0: number, ayanT0: number): void {
   swiInitSwedIfStart(swed);
-  const sidBits = sidMode & SE_SIDBITS;
-  const sidModeBase = sidMode & 0xFF;
+  if (sidMode < 0) sidMode = 0;
   swed.sidd.sidMode = sidMode;
-  if (sidModeBase === SE_SIDM_USER) {
-    swed.sidd.ayanT0 = ayanT0;
-    swed.sidd.t0 = t0;
-  } else if (sidModeBase < SE_NSIDM_PREDEF) {
-    const ayaInit = AYANAMSA[sidModeBase];
-    swed.sidd.ayanT0 = ayaInit.ayanT0;
-    swed.sidd.t0 = ayaInit.t0;
-    swed.sidd.t0IsUT = ayaInit.t0IsUT;
+  let sidModeBase = sidMode;
+  if (sidModeBase >= SE_SIDBITS) {
+    sidModeBase %= SE_SIDBITS;
+  }
+  /* Standard equinoxes: positions always referred to ecliptic of t0 */
+  if (sidModeBase === SE_SIDM_J2000 || sidModeBase === SE_SIDM_J1900 ||
+      sidModeBase === SE_SIDM_B1950 || sidModeBase === SE_SIDM_GALALIGN_MARDYKS) {
+    swed.sidd.sidMode = sidModeBase | SE_SIDBIT_ECL_T0;
+  }
+  /* Star-based modes: strip user bits */
+  if (sidModeBase === SE_SIDM_TRUE_CITRA || sidModeBase === SE_SIDM_TRUE_REVATI ||
+      sidModeBase === SE_SIDM_TRUE_PUSHYA || sidModeBase === SE_SIDM_TRUE_SHEORAN ||
+      sidModeBase === SE_SIDM_TRUE_MULA ||
+      sidModeBase === SE_SIDM_GALCENT_0SAG || sidModeBase === SE_SIDM_GALCENT_COCHRANE ||
+      sidModeBase === SE_SIDM_GALCENT_RGILBRAND || sidModeBase === SE_SIDM_GALCENT_MULA_WILHELM ||
+      sidModeBase === SE_SIDM_GALEQU_IAU1958 || sidModeBase === SE_SIDM_GALEQU_TRUE ||
+      sidModeBase === SE_SIDM_GALEQU_MULA) {
+    swed.sidd.sidMode = sidModeBase;
+  }
+  /* Ensure sidModeBase is valid */
+  if (sidModeBase >= SE_NSIDM_PREDEF && sidModeBase !== SE_SIDM_USER) {
+    swed.sidd.sidMode = sidModeBase = SE_SIDM_FAGAN_BRADLEY;
   }
   swed.ayanaIsSet = true;
+  if (sidModeBase === SE_SIDM_USER) {
+    swed.sidd.t0 = t0;
+    swed.sidd.ayanT0 = ayanT0;
+    swed.sidd.t0IsUT = false;
+    if (swed.sidd.sidMode & SE_SIDBIT_USER_UT) {
+      swed.sidd.t0IsUT = true;
+    }
+  } else {
+    swed.sidd.t0 = AYANAMSA[sidModeBase].t0;
+    swed.sidd.ayanT0 = AYANAMSA[sidModeBase].ayanT0;
+    swed.sidd.t0IsUT = AYANAMSA[sidModeBase].t0IsUT;
+  }
+  /* SE_SIDBIT_PREC_ORIG: use original precession model for this ayanamsa */
+  if (sidModeBase < SE_NSIDM_PREDEF &&
+      (swed.sidd.sidMode & SE_SIDBIT_PREC_ORIG) !== 0 &&
+      AYANAMSA[sidModeBase].precOffset > 0) {
+    swed.astroModels[SE_MODEL_PREC_LONGTERM] = AYANAMSA[sidModeBase].precOffset;
+    swed.astroModels[SE_MODEL_PREC_SHORTTERM] = AYANAMSA[sidModeBase].precOffset;
+    switch (AYANAMSA[sidModeBase].precOffset) {
+      case SEMOD_PREC_NEWCOMB:
+        swed.astroModels[SE_MODEL_NUT] = SEMOD_NUT_WOOLARD;
+        break;
+      case SEMOD_PREC_IAU_1976:
+        swed.astroModels[SE_MODEL_NUT] = SEMOD_NUT_IAU_1980;
+        break;
+      default:
+        break;
+    }
+  }
   swiForceAppPosEtc(swed);
 }
 
@@ -2229,6 +2460,52 @@ export function sweGetAyanamsaUt(swed: SweData, tjdUt: number): number {
   return sweGetAyanamsa(swed, tjdUt + dt);
 }
 
+/**
+ * Compute precession offset correction for ayanamsa.
+ * When an ayanamsa was defined using a different precession model than the
+ * current default, this function computes the correction to keep sidereal
+ * positions consistent.
+ * Ported from C's get_aya_correction() (sweph.c:2959-2999).
+ */
+function getAyaCorrection(iflag: number, swed: SweData): number {
+  const sip = swed.sidd;
+  const precModel = swed.astroModels[SE_MODEL_PREC_LONGTERM];
+  const precModelShort = swed.astroModels[SE_MODEL_PREC_SHORTTERM];
+  const sidModeBase = sip.sidMode % SE_SIDBITS;
+  if (sip.t0 === J2000) return 0;
+  if (sip.sidMode & SE_SIDBIT_NO_PREC_OFFSET) return 0;
+  let precOffset = 0;
+  if (sidModeBase < SE_NSIDM_PREDEF) {
+    precOffset = AYANAMSA[sidModeBase].precOffset;
+  }
+  if (precOffset < 0) precOffset = 0;
+  if (precOffset === 0) return 0;
+  if (precModel === precOffset) return 0;
+  let t0 = sip.t0;
+  if (sip.t0IsUT) {
+    t0 += sweDeltatEx(t0, iflag, swed);
+  }
+  /* Vernal point at t0, cartesian */
+  const x = [1, 0, 0];
+  /* Precess from t0 to J2000 using current precession model */
+  swiPrecess(x, t0, 0, J_TO_J2000, swed);
+  /* Switch to original precession model, precess from J2000 to t0 */
+  swed.astroModels[SE_MODEL_PREC_LONGTERM] = precOffset;
+  swed.astroModels[SE_MODEL_PREC_SHORTTERM] = precOffset;
+  swiPrecess(x, t0, 0, J2000_TO_J, swed);
+  /* Restore original precession models */
+  swed.astroModels[SE_MODEL_PREC_LONGTERM] = precModel;
+  swed.astroModels[SE_MODEL_PREC_SHORTTERM] = precModelShort;
+  /* Convert to ecliptic of t0 */
+  const eps = swiEpsiln(t0, 0, swed);
+  swiCoortrf(x, x, eps);
+  /* Convert to polar */
+  swiCartpol(x, x);
+  let corr = x[0] * RADTODEG;
+  if (corr > 350) corr -= 360;
+  return corr;
+}
+
 /** Internal ayanamsa computation */
 function swiGetAyanamsaEx(
   swed: SweData, tjdEt: number, iflag: number,
@@ -2238,7 +2515,6 @@ function swiGetAyanamsaEx(
     sweSetSidMode(swed, SE_SIDM_FAGAN_BRADLEY, 0, 0);
   }
   const sidMode = swed.sidd.sidMode;
-  const sidBits = sidMode & SE_SIDBITS;
   const sidModeBase = sidMode & 0xFF;
   let t0 = swed.sidd.t0;
   const ayanT0 = swed.sidd.ayanT0;
@@ -2316,33 +2592,55 @@ function swiGetAyanamsaEx(
     if (res.flags === ERR) return { retc: ERR, daya: 0, serr: res.serr };
     return { retc: res.flags & SEFLG_EPHMASK, daya: sweDegnorm(res.xx[0] - 150 - 6.6666666667), serr: '' };
   }
-  /* Get the reference date t0 */
+  /* Get the reference date t0 in ET */
   let tjd0 = t0;
   if (t0IsUT) {
     tjd0 = t0 + sweDeltatEx(t0, iflag, swed);
   }
-  /* General precession since t0 */
-  const { dpre: dPreJ, deps: dOblJ } = swiLdpPeps(tjdEt);
-  const { dpre: dPre0, deps: dObl0 } = swiLdpPeps(tjd0);
-  /* Precession correction for ayanamsa */
-  let precCorr = 0;
-  if (sidModeBase < SE_NSIDM_PREDEF && AYANAMSA[sidModeBase].precOffset !== 0 &&
-      AYANAMSA[sidModeBase].precOffset !== -1 &&
-      (sidBits & SE_SIDBIT_NO_PREC_OFFSET) === 0 &&
-      (sidBits & SE_SIDBIT_PREC_ORIG) === 0) {
-    /* Apply precession offset correction */
-    /* For now, simplified: no precession model switching */
+  const x = [0, 0, 0, 0, 0, 0];
+  let eps: number;
+  if (!(sidMode & SE_SIDBIT_ECL_DATE)) {
+    /* Default branch: vernal point precessed from tjd_et to t0,
+     * measured on ecliptic of t0 */
+    x[0] = 1; x[1] = x[2] = x[3] = x[4] = x[5] = 0;
+    /* to J2000 */
+    if (tjdEt !== J2000) {
+      swiPrecess(x, tjdEt, 0, J_TO_J2000, swed);
+    }
+    /* to t0 */
+    swiPrecess(x, tjd0, 0, J2000_TO_J, swed);
+    /* to ecliptic t0 */
+    eps = swiEpsiln(tjd0, 0, swed);
+    swiCoortrf(x, x, eps);
+    /* to polar */
+    swiCartpol(x, x);
+    /* subtract initial value of ayanamsa */
+    x[0] = -x[0] * RADTODEG + ayanT0;
+  } else {
+    /* ECL_DATE branch: ayanamsa measured on ecliptic of date */
+    x[0] = sweDegnorm(ayanT0) * DEGTORAD;
+    x[1] = 0; x[2] = 1;
+    /* get epsilon for t0 */
+    eps = swiEpsiln(tjd0, 0, swed);
+    /* to cartesian equatorial relative to equinox t0 */
+    swiPolcart(x, x);
+    swiCoortrf(x, x, -eps);
+    /* precess to J2000 */
+    if (tjd0 !== J2000) {
+      swiPrecess(x, tjd0, 0, J_TO_J2000, swed);
+    }
+    /* precess to date */
+    swiPrecess(x, tjdEt, 0, J2000_TO_J, swed);
+    /* epsilon of date */
+    eps = swiEpsiln(tjdEt, 0, swed);
+    /* to ecliptic of date, then to polar */
+    swiCoortrf(x, x, eps);
+    swiCartpol(x, x);
+    x[0] = sweDegnorm(x[0] * RADTODEG);
   }
-  /* Ayanamsa = initial offset + precession from t0 to tjd */
-  let daya = (dPreJ - dPre0) * RADTODEG + ayanT0;
-  /* SSY_PLANE correction */
-  if (sidBits & SE_SIDBIT_SSY_PLANE) {
-    /* project onto solar system invariable plane */
-    /* not yet supported - skip */
-  }
-  /* ECL_T0 and ECL_DATE modes */
-  /* These are not supported in simplified mode */
-  return { retc: OK, daya: sweDegnorm(daya), serr };
+  const corr = getAyaCorrection(iflag, swed);
+  const daya = sweDegnorm(x[0] - corr);
+  return { retc: iflag, daya, serr };
 }
 
 /** Get ayanamsa with speed */
@@ -2363,7 +2661,11 @@ export function swiGetAyanamsaWithSpeed(
   return { retc: OK, daya: res.daya, dayaSpeed, serr: res.serr };
 }
 
-/** Tropical RA → sidereal longitude */
+/**
+ * Tropical RA → sidereal longitude (ECL_T0 mode).
+ * Converts J2000 equatorial cartesian to sidereal ecliptic at t0.
+ * Ported from C's swi_trop_ra2sid_lon (sweph.c:3272-3300).
+ */
 export function swiTropRa2SidLon(
   xin: Float64Array | number[],
   xout: Float64Array | number[],
@@ -2371,20 +2673,87 @@ export function swiTropRa2SidLon(
   iflag: number,
   swed: SweData,
 ): void {
-  /* Not yet implemented for this simplified port */
-  for (let i = 0; i < 6; i++) xout[i] = xin[i];
-  for (let i = 0; i < 6; i++) xoutr[i] = xin[i];
+  const sip = swed.sidd;
+  const x = [0, 0, 0, 0, 0, 0];
+  for (let i = 0; i <= 5; i++) x[i] = xin[i];
+  if (sip.t0 !== J2000) {
+    /* iflag must not contain SEFLG_JPLHOR here */
+    swiPrecess(x, sip.t0, 0, J2000_TO_J, swed);
+    const spd = [x[3], x[4], x[5]];
+    swiPrecess(spd, sip.t0, 0, J2000_TO_J, swed); /* speed */
+    x[3] = spd[0]; x[4] = spd[1]; x[5] = spd[2];
+  }
+  for (let i = 0; i <= 5; i++) xoutr[i] = x[i];
+  const oectmp = createEpsilon();
+  calcEpsilon(sip.t0, iflag, oectmp, swed);
+  swiCoortrf2(x, x, oectmp.seps, oectmp.ceps);
+  if (iflag & SEFLG_SPEED) {
+    swiCoortrf2(x, x, oectmp.seps, oectmp.ceps, 3, 3);
+  }
+  /* to polar coordinates */
+  swiCartpolSp(x, x);
+  /* subtract ayan_t0 */
+  const corr = getAyaCorrection(iflag, swed);
+  x[0] -= sip.ayanT0 * DEGTORAD;
+  x[0] = sweRadnorm(x[0] + corr * DEGTORAD);
+  /* back to cartesian */
+  swiPolcartSp(x, xout);
 }
 
-/** Tropical RA → sidereal longitude (Sosy method) */
+/**
+ * Tropical RA → sidereal longitude (SSY_PLANE mode).
+ * Projects J2000 equatorial cartesian onto the solar system invariable plane.
+ * Ported from C's swi_trop_ra2sid_lon_sosy (sweph.c:3307-3355).
+ */
 export function swiTropRa2SidLonSosy(
   xin: Float64Array | number[],
   xout: Float64Array | number[],
   iflag: number,
   swed: SweData,
 ): void {
-  /* Not yet implemented for this simplified port */
-  for (let i = 0; i < 6; i++) xout[i] = xin[i];
+  const sip = swed.sidd;
+  const oe = swed.oec2000;
+  const planeNode = SSY_PLANE_NODE_E2000;
+  const planeIncl = SSY_PLANE_INCL;
+  const x = [0, 0, 0, 0, 0, 0];
+  for (let i = 0; i <= 5; i++) x[i] = xin[i];
+  /* planet to ecliptic 2000 */
+  swiCoortrf2(x, x, oe.seps, oe.ceps);
+  if (iflag & SEFLG_SPEED) {
+    swiCoortrf2(x, x, oe.seps, oe.ceps, 3, 3);
+  }
+  /* to polar coordinates */
+  swiCartpolSp(x, x);
+  /* to solar system equator */
+  x[0] -= planeNode;
+  swiPolcartSp(x, x);
+  swiCoortrf(x, x, planeIncl);
+  swiCoortrf(x, x, planeIncl, 3, 3);
+  swiCartpolSp(x, x);
+  /* zero point of t0 in J2000 system */
+  const x0 = [1, 0, 0];
+  if (sip.t0 !== J2000) {
+    /* iflag must not contain SEFLG_JPLHOR here */
+    swiPrecess(x0, sip.t0, 0, J_TO_J2000, swed);
+  }
+  /* zero point to ecliptic 2000 */
+  swiCoortrf2(x0, x0, oe.seps, oe.ceps);
+  /* to polar coordinates */
+  swiCartpol(x0, x0);
+  /* to solar system equator */
+  x0[0] -= planeNode;
+  swiPolcart(x0, x0);
+  swiCoortrf(x0, x0, planeIncl);
+  swiCartpol(x0, x0);
+  /* measure planet from zero point */
+  x[0] -= x0[0];
+  x[0] *= RADTODEG;
+  /* subtract ayan_t0 */
+  const corr = getAyaCorrection(iflag, swed);
+  x[0] -= sip.ayanT0;
+  x[0] = sweDegnorm(x[0] + corr) * DEGTORAD;
+  /* back to cartesian */
+  swiPolcartSp(x, xout);
 }
 
 /* ================================================================
@@ -2444,7 +2813,7 @@ function readConst(
     return closeAndError(fdp, swed, `Ephemeris file ${fdp.fnam} is damaged (0b).`);
   }
   const fnamFromFile = fnameLine.trim().toLowerCase();
-  const fnamActual = fdp.fnam.toLowerCase().replace(/^.*\//, '');
+  const fnamActual = fdp.fnam.toLowerCase().replace(/^.*[\/\\]/, '');
   if (fnamFromFile !== fnamActual) {
     return closeAndError(fdp, swed, `Ephemeris file name '${fnamActual}' wrong; rename '${fnamFromFile}'.`);
   }
@@ -2467,8 +2836,7 @@ function readConst(
     while (si < elemLine.length && elemLine[si] >= '0' && elemLine[si] <= '9') si++;
     if (si < elemLine.length) si++; // skip space after number
     const nameOffset = si;
-    const lastnam = 19;
-    fdp.astnam = elemLine.substring(nameOffset, nameOffset + lastnam + nameOffset).trim();
+    /* Name will be parsed properly in the "asteroid name" section below */
     swed.astH = parseFloat(elemLine.substring(35 + nameOffset) || '0');
     swed.astG = parseFloat(elemLine.substring(42 + nameOffset) || '0');
     if (swed.astG === 0) swed.astG = 0.15;
@@ -2494,7 +2862,7 @@ function readConst(
   reader.setLittleEndian(isLittleEndian);
   fdp.iflg = isLittleEndian ? 1 : 0; // store endianness in iflg (1=LE, 0=BE)
   /* ---- file length check ---- */
-  const storedLen = reader.readInt32();
+  const storedLen = reader.readUint32();
   if (storedLen !== reader.length) {
     return closeAndError(fdp, swed, `Ephemeris file ${fdp.fnam} is damaged (0h).`);
   }
@@ -2516,13 +2884,31 @@ function readConst(
   fdp.npl = nplan;
   /* ---- which planets ---- */
   for (let i = 0; i < nplan; i++) {
-    fdp.ipl[i] = nbytesIpl === 4 ? reader.readInt32() : reader.readUintN(nbytesIpl);
+    fdp.ipl[i] = nbytesIpl === 4 ? reader.readUint32() : reader.readUintN(nbytesIpl);
   }
   /* ---- asteroid name (if applicable) ---- */
   if (ifno === SEI_FILE_ANY_AST) {
-    /* Read 30-byte name field (may contain old-style name or be overridden) */
-    reader.readBytes(30); // skip old name field
-    /* Name was already parsed from orbital elements above */
+    /* C: parses MPC number from the saved element line (sastnam).
+     * If MPC number matches the asteroid IPL, the name is extracted
+     * from the element line after the MPC number (Bowell database format).
+     * Otherwise, the name is read from the old 30-byte name field. */
+    const sastnam = swed.astelem;
+    let j = 4; // old astorb.dat had only 4 characters for MPC#
+    while (j < 10 && j < sastnam.length && sastnam[j] !== ' ') j++;
+    const mpcNum = parseInt(sastnam.substring(0, j), 10) || 0;
+    if (mpcNum === fdp.ipl[0] - SE_AST_OFFSET || mpcNum === fdp.ipl[0]) {
+      /* element record is from Bowell database: extract name after MPC number */
+      const lastnam = 19;
+      fdp.astnam = sastnam.substring(j + 1, j + 1 + lastnam).trim();
+      /* overread old 30-byte name field */
+      reader.readBytes(30);
+    } else {
+      /* older element record: name is taken from old 30-byte name field */
+      fdp.astnam = reader.readCString(30);
+    }
+    /* truncate at double space */
+    const dblSp = fdp.astnam.indexOf('  ');
+    if (dblSp >= 0) fdp.astnam = fdp.astnam.substring(0, dblSp);
   }
   /* ---- CRC check ---- */
   const crcPos = reader.position;
@@ -2551,7 +2937,7 @@ function readConst(
       pdp = swed.pldat[iplFile];
     }
     pdp.ibdy = iplFile;
-    pdp.lndx0 = reader.readInt32();
+    pdp.lndx0 = reader.readUint32();
     /* flags: 1 byte → int32 */
     pdp.iflg = reader.readUint8();
     /* ncoe: 1 byte → int */
@@ -2606,8 +2992,15 @@ function getNewSegment(
   const fdp = swed.fidat[ifno];
   const reader = fdp.reader;
   if (!reader) return { retc: ERR, serr: 'no reader' };
+  /* validate segment parameters */
+  if (!Number.isFinite(pdp.dseg) || pdp.dseg <= 0) {
+    return { retc: ERR, serr: `getNewSegment: invalid dseg ${pdp.dseg} for ipli=${ipli} ifno=${ifno}` };
+  }
   /* compute segment number */
-  const iseg = Math.floor((tjd - pdp.tfstart) / pdp.dseg);
+  const iseg = Math.trunc((tjd - pdp.tfstart) / pdp.dseg);
+  if (!Number.isFinite(iseg) || iseg < 0 || iseg > pdp.nndx) {
+    return { retc: ERR, serr: `getNewSegment: iseg ${iseg} out of range [0, ${pdp.nndx}] for ipli=${ipli}` };
+  }
   pdp.tseg0 = pdp.tfstart + iseg * pdp.dseg;
   pdp.tseg1 = pdp.tseg0 + pdp.dseg;
   /* get file position of coefficients from segment index */
@@ -2830,7 +3223,7 @@ function sweph(
       return { retc: NOT_AVAILABLE, serr: '' };
     }
     fdp.reader = new SE1FileReader(buffer);
-    fdp.fnam = fname.replace(/^.*\//, ''); // basename
+    fdp.fnam = fname.replace(/^.*[\/\\]/, ''); // basename (handle both / and \)
     const rc = readConst(ifno, swed);
     if (rc.retc !== OK) return rc;
   }
@@ -3870,9 +4263,14 @@ export function sweCalcPctr(
   /* sidereal */
   if (iflag & SEFLG_SIDEREAL) {
     if (swed.sidd.sidMode & SE_SIDBIT_ECL_T0) {
-      swiTropRa2SidLon(xxsv, xreturn.slice(6), xreturn.slice(18), iflag, swed);
+      const tmpEcl = [0, 0, 0, 0, 0, 0];
+      const tmpEqu = [0, 0, 0, 0, 0, 0];
+      swiTropRa2SidLon(xxsv, tmpEcl, tmpEqu, iflag, swed);
+      for (let i = 0; i <= 5; i++) { xreturn[6 + i] = tmpEcl[i]; xreturn[18 + i] = tmpEqu[i]; }
     } else if (swed.sidd.sidMode & SE_SIDBIT_SSY_PLANE) {
-      swiTropRa2SidLonSosy(xxsv, xreturn.slice(6), iflag, swed);
+      const tmpEcl = [0, 0, 0, 0, 0, 0];
+      swiTropRa2SidLonSosy(xxsv, tmpEcl, iflag, swed);
+      for (let i = 0; i <= 5; i++) xreturn[6 + i] = tmpEcl[i];
     } else {
       /* traditional: convert to polar, apply ayanamsa, convert back */
       const eclPol = [0, 0, 0, 0, 0, 0];
