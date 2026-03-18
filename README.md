@@ -16,10 +16,61 @@ This library lets you calculate the positions of the Sun, Moon, planets, and sta
 - **Orbital elements** — Keplerian elements, nodes, apsides
 - **Date conversions** — Julian day, UTC, Delta T, sidereal time
 
+## Supported Environments
+
+This is a pure TypeScript library with **zero native dependencies** — no WASM, no C bindings, no filesystem access. It runs anywhere JavaScript runs:
+
+| Environment | Status | Notes |
+|---|---|---|
+| **Node.js** | Fully supported | Load `.se1` files via `fs.readFileSync()` |
+| **Browser** | Fully supported | Load `.se1` files via `fetch()` or bundle as assets |
+| **React Native** | Fully supported | Load `.se1` files via `expo-file-system`, `react-native-fs`, or `fetch()` from a remote URL |
+| **Cloudflare Workers / Edge** | Fully supported | Load `.se1` files via `fetch()` or bind as R2/KV assets |
+| **Deno / Bun** | Fully supported | Load `.se1` files via their respective file APIs |
+
+The library uses only standard JavaScript APIs (`ArrayBuffer`, `DataView`, `Float64Array`, `TextDecoder`, `Math`) — no platform-specific code. Ephemeris data files are loaded as `ArrayBuffer`s, so you can source them however your environment allows.
+
+**Moshier mode** (the default) requires no data files at all — it uses built-in analytical models and works out of the box in every environment.
+
 ## Installation
+
+### Node.js
 
 ```bash
 npm install @typescriptify/sweph
+```
+
+### Browser (Vite, Webpack, etc.)
+
+```bash
+npm install @typescriptify/sweph
+```
+
+Then import as usual — your bundler will handle the rest. If you need `.se1` files, serve them as static assets and load with `fetch()`.
+
+### React Native
+
+```bash
+npm install @typescriptify/sweph
+```
+
+The library works with both the Hermes and JSC engines. `TextDecoder` (used internally for reading star names from binary files) is available in Hermes 0.70+ and JSC. If you target an older engine, add a polyfill like `text-encoding`.
+
+To load `.se1` files you have three options:
+- **Bundle as app assets** and read with `expo-file-system` or `react-native-fs`
+- **Fetch from a remote URL** at runtime
+- **Skip `.se1` files entirely** and use Moshier mode (no files needed, ~1 arcsecond precision)
+
+### Deno
+
+```typescript
+import { SwissEph } from '@typescriptify/sweph/SwissEph';
+```
+
+### Bun
+
+```bash
+bun add @typescriptify/sweph
 ```
 
 ## Two API Styles
@@ -146,41 +197,161 @@ For other date ranges, download the corresponding files (e.g., `sepl_06.se1` for
 
 ### How to load them
 
-Since this is a pure TypeScript library (no filesystem access), you load files as `ArrayBuffer`s. How you get the `ArrayBuffer` depends on your environment:
+Since this is a pure TypeScript library (no filesystem access), you load files as `ArrayBuffer`s. How you get the `ArrayBuffer` depends on your environment.
 
-**Node.js:**
+All examples below use the **Modern API** (`SwissEph` class). For the C-style API equivalent, use `sweSetEphemerisFile(filename, buffer, swed)` instead.
+
+#### Node.js
+
 ```typescript
 import { readFileSync } from 'fs';
-import { sweSetEphemerisFile, sweCalc } from '@typescriptify/sweph/sweph';
-import { createDefaultSweData } from '@typescriptify/sweph/types';
-import { SE_SUN, SEFLG_SWIEPH, SEFLG_SPEED } from '@typescriptify/sweph/constants';
+import { SwissEph } from '@typescriptify/sweph/SwissEph';
+import { SE_SUN } from '@typescriptify/sweph/constants';
 
-const swed = createDefaultSweData();
+const swe = new SwissEph({ ephemeris: 'swisseph' });
 
-// Load the planet and moon ephemeris files
+// Load .se1 files from disk
 const seplBuf = readFileSync('./ephe/sepl_18.se1');
 const semoBuf = readFileSync('./ephe/semo_18.se1');
 
-sweSetEphemerisFile('sepl_18.se1', seplBuf.buffer, swed);
-sweSetEphemerisFile('semo_18.se1', semoBuf.buffer, swed);
+swe.loadEphemerisFile(seplBuf.buffer.slice(seplBuf.byteOffset, seplBuf.byteOffset + seplBuf.byteLength), 'sepl_18.se1');
+swe.loadEphemerisFile(semoBuf.buffer.slice(semoBuf.byteOffset, semoBuf.byteOffset + semoBuf.byteLength), 'semo_18.se1');
 
-// Now you can use SEFLG_SWIEPH for higher precision
-const sun = sweCalc(swed, 2451545.0, SE_SUN, SEFLG_SWIEPH | SEFLG_SPEED);
-console.log(`Sun (SWIEPH): ${sun.xx[0].toFixed(6)}°`);
+// Calculate with Swiss Ephemeris precision
+const jd = SwissEph.julianDay(2025, 1, 1, 12);
+const sun = swe.calc(jd, SE_SUN);
+console.log(`Sun: ${sun.longitude.toFixed(6)}°`);
+
+swe.close();
 ```
 
-**Browser (fetch):**
+#### Browser
+
+Serve the `.se1` files as static assets (e.g., in your `public/` folder) and fetch them:
+
 ```typescript
-const response = await fetch('/ephe/sepl_18.se1');
-const buffer = await response.arrayBuffer();
-sweSetEphemerisFile('sepl_18.se1', buffer, swed);
+import { SwissEph } from '@typescriptify/sweph/SwissEph';
+import { SE_SUN } from '@typescriptify/sweph/constants';
+
+const swe = new SwissEph({ ephemeris: 'swisseph' });
+
+// Fetch .se1 files from your static assets
+const [seplBuf, semoBuf] = await Promise.all([
+  fetch('/ephe/sepl_18.se1').then(r => r.arrayBuffer()),
+  fetch('/ephe/semo_18.se1').then(r => r.arrayBuffer()),
+]);
+
+swe.loadEphemerisFile(seplBuf, 'sepl_18.se1');
+swe.loadEphemerisFile(semoBuf, 'semo_18.se1');
+
+const jd = SwissEph.julianDay(2025, 1, 1, 12);
+const sun = swe.calc(jd, SE_SUN);
+console.log(`Sun: ${sun.longitude.toFixed(6)}°`);
+
+swe.close();
 ```
 
-**React Native (expo-file-system, react-native-fs, etc.):**
+#### React Native with Expo
+
+Use `expo-asset` to bundle the files and `expo-file-system` to read them:
+
 ```typescript
-// Read the file into an ArrayBuffer using your preferred file library,
-// then pass it to sweSetEphemerisFile() the same way.
+import { Asset } from 'expo-asset';
+import * as FileSystem from 'expo-file-system';
+import { SwissEph } from '@typescriptify/sweph/SwissEph';
+import { SE_SUN } from '@typescriptify/sweph/constants';
+
+async function loadEpheFile(asset: Asset): Promise<ArrayBuffer> {
+  await asset.downloadAsync();
+  const base64 = await FileSystem.readAsStringAsync(asset.localUri!, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+  // Decode base64 to ArrayBuffer
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+const swe = new SwissEph({ ephemeris: 'swisseph' });
+
+const seplAsset = Asset.fromModule(require('./assets/ephe/sepl_18.se1'));
+const semoAsset = Asset.fromModule(require('./assets/ephe/semo_18.se1'));
+
+swe.loadEphemerisFile(await loadEpheFile(seplAsset), 'sepl_18.se1');
+swe.loadEphemerisFile(await loadEpheFile(semoAsset), 'semo_18.se1');
+
+const jd = SwissEph.julianDay(2025, 1, 1, 12);
+const sun = swe.calc(jd, SE_SUN);
+console.log(`Sun: ${sun.longitude.toFixed(6)}°`);
+
+swe.close();
 ```
+
+> **Note:** You'll need to configure your `metro.config.js` to recognize `.se1` as an asset extension:
+> ```js
+> const { getDefaultConfig } = require('expo/metro-config');
+> const config = getDefaultConfig(__dirname);
+> config.resolver.assetExts.push('se1');
+> module.exports = config;
+> ```
+
+#### React Native with react-native-fs
+
+```typescript
+import RNFS from 'react-native-fs';
+import { SwissEph } from '@typescriptify/sweph/SwissEph';
+import { SE_SUN } from '@typescriptify/sweph/constants';
+
+async function loadEpheFile(filename: string): Promise<ArrayBuffer> {
+  const base64 = await RNFS.readFileAssets(`ephe/${filename}`, 'base64');
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+const swe = new SwissEph({ ephemeris: 'swisseph' });
+
+swe.loadEphemerisFile(await loadEpheFile('sepl_18.se1'), 'sepl_18.se1');
+swe.loadEphemerisFile(await loadEpheFile('semo_18.se1'), 'semo_18.se1');
+
+const jd = SwissEph.julianDay(2025, 1, 1, 12);
+const sun = swe.calc(jd, SE_SUN);
+console.log(`Sun: ${sun.longitude.toFixed(6)}°`);
+
+swe.close();
+```
+
+> **Android:** Place `.se1` files in `android/app/src/main/assets/ephe/`.
+> **iOS:** Add `.se1` files to your Xcode project's bundle resources.
+
+#### React Native — fetch from a remote URL
+
+The simplest approach if you don't want to bundle the files:
+
+```typescript
+import { SwissEph } from '@typescriptify/sweph/SwissEph';
+import { SE_SUN } from '@typescriptify/sweph/constants';
+
+const swe = new SwissEph({ ephemeris: 'swisseph' });
+
+const [seplBuf, semoBuf] = await Promise.all([
+  fetch('https://your-server.com/ephe/sepl_18.se1').then(r => r.arrayBuffer()),
+  fetch('https://your-server.com/ephe/semo_18.se1').then(r => r.arrayBuffer()),
+]);
+
+swe.loadEphemerisFile(seplBuf, 'sepl_18.se1');
+swe.loadEphemerisFile(semoBuf, 'semo_18.se1');
+
+const jd = SwissEph.julianDay(2025, 1, 1, 12);
+const sun = swe.calc(jd, SE_SUN);
+console.log(`Sun: ${sun.longitude.toFixed(6)}°`);
+
+swe.close();
+```
+
+> **Tip:** The `.se1` files are ~1.5 MB each. Consider caching them locally after the first download using `AsyncStorage` or the device filesystem to avoid re-downloading on every app launch.
 
 ### Loading JPL files
 
