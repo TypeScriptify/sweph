@@ -24,7 +24,8 @@ This is a pure TypeScript library with **zero native dependencies** — no WASM,
 |---|---|---|
 | **Node.js** | Fully supported | Load `.se1` files via `fs.readFileSync()` |
 | **Browser** | Fully supported | Load `.se1` files via `fetch()` or bundle as assets |
-| **React Native** | Fully supported | Load `.se1` files via `expo-file-system`, `react-native-fs`, or `fetch()` from a remote URL |
+| **React Native (Expo)** | Fully supported | Load `.se1` files via `expo-asset` + `expo-file-system`, or `fetch()` from a remote URL |
+| **React Native (Bare)** | Fully supported | Load `.se1` files via `react-native-fs` with manual platform asset placement, or `fetch()` |
 | **Cloudflare Workers / Edge** | Fully supported | Load `.se1` files via `fetch()` or bind as R2/KV assets |
 | **Deno / Bun** | Fully supported | Load `.se1` files via their respective file APIs |
 
@@ -48,18 +49,25 @@ npm install @typescriptify/sweph
 
 Then import as usual — your bundler will handle the rest. If you need `.se1` files, serve them as static assets and load with `fetch()`.
 
-### React Native
+### React Native (Expo)
+
+```bash
+npx expo install @typescriptify/sweph
+```
+
+Expo's asset bundler handles file placement for both Android and iOS. See [Loading .se1 files with Expo](#react-native-expo) below.
+
+### React Native (Bare / without Expo)
 
 ```bash
 npm install @typescriptify/sweph
 ```
 
-The library works with both the Hermes and JSC engines. `TextDecoder` (used internally for reading star names from binary files) is available in Hermes 0.70+ and JSC. If you target an older engine, add a polyfill like `text-encoding`.
+You'll need `react-native-fs` to read bundled `.se1` files, and you must place them manually in each platform's asset directory. See [Loading .se1 files with bare React Native](#react-native-bare--without-expo) below.
 
-To load `.se1` files you have three options:
-- **Bundle as app assets** and read with `expo-file-system` or `react-native-fs`
-- **Fetch from a remote URL** at runtime
-- **Skip `.se1` files entirely** and use Moshier mode (no files needed, ~1 arcsecond precision)
+### React Native — engine compatibility
+
+The library works with both the Hermes and JSC engines. `TextDecoder` (used internally for reading star names from binary files) is available in Hermes 0.70+ and JSC. If you target an older engine, add a polyfill like `text-encoding`.
 
 ### Deno
 
@@ -251,9 +259,22 @@ console.log(`Sun: ${sun.longitude.toFixed(6)}°`);
 swe.close();
 ```
 
-#### React Native with Expo
+#### React Native (Expo)
 
-Use `expo-asset` to bundle the files and `expo-file-system` to read them:
+Expo handles asset bundling for both Android and iOS automatically. Place your `.se1` files anywhere in your project (e.g., `./assets/ephe/`), then use `expo-asset` and `expo-file-system` to load them.
+
+**1. Configure Metro to recognize `.se1` files**
+
+Update your `metro.config.js`:
+
+```js
+const { getDefaultConfig } = require('expo/metro-config');
+const config = getDefaultConfig(__dirname);
+config.resolver.assetExts.push('se1');
+module.exports = config;
+```
+
+**2. Load and use the ephemeris files**
 
 ```typescript
 import { Asset } from 'expo-asset';
@@ -288,23 +309,33 @@ console.log(`Sun: ${sun.longitude.toFixed(6)}°`);
 swe.close();
 ```
 
-> **Note:** You'll need to configure your `metro.config.js` to recognize `.se1` as an asset extension:
-> ```js
-> const { getDefaultConfig } = require('expo/metro-config');
-> const config = getDefaultConfig(__dirname);
-> config.resolver.assetExts.push('se1');
-> module.exports = config;
-> ```
+#### React Native (Bare / without Expo)
 
-#### React Native with react-native-fs
+Without Expo's asset bundler, you need to place files manually in each platform's asset location and use `react-native-fs` to read them.
+
+**1. Place `.se1` files in the platform-specific asset directories**
+
+- **Android:** Copy `.se1` files into `android/app/src/main/assets/ephe/`
+- **iOS:** Add `.se1` files to your Xcode project and include them in the "Copy Bundle Resources" build phase
+
+**2. Load and use the ephemeris files**
 
 ```typescript
 import RNFS from 'react-native-fs';
+import { Platform } from 'react-native';
 import { SwissEph } from '@typescriptify/sweph/SwissEph';
 import { SE_SUN } from '@typescriptify/sweph/constants';
 
 async function loadEpheFile(filename: string): Promise<ArrayBuffer> {
-  const base64 = await RNFS.readFileAssets(`ephe/${filename}`, 'base64');
+  let base64: string;
+  if (Platform.OS === 'android') {
+    // Android reads from android/app/src/main/assets/
+    base64 = await RNFS.readFileAssets(`ephe/${filename}`, 'base64');
+  } else {
+    // iOS reads from the app bundle
+    const path = `${RNFS.MainBundlePath}/ephe/${filename}`;
+    base64 = await RNFS.readFile(path, 'base64');
+  }
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
@@ -323,12 +354,9 @@ console.log(`Sun: ${sun.longitude.toFixed(6)}°`);
 swe.close();
 ```
 
-> **Android:** Place `.se1` files in `android/app/src/main/assets/ephe/`.
-> **iOS:** Add `.se1` files to your Xcode project's bundle resources.
-
 #### React Native — fetch from a remote URL
 
-The simplest approach if you don't want to bundle the files:
+This works with both Expo and bare React Native. It's the simplest approach if you don't want to bundle the files with your app:
 
 ```typescript
 import { SwissEph } from '@typescriptify/sweph/SwissEph';
