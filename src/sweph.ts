@@ -1078,11 +1078,89 @@ function appPosEtcPlan(ipl: number, iflag: number, swed: SweData): number {
       for (let i = 0; i <= 5; i++) xx[i] -= psdp.x[i];
     }
   }
-  /* Light-time correction */
-  if ((iflag & SEFLG_TRUEPOS) === 0) {
+  /* Light-time correction
+   *
+   * Port of sweph.c app_pos_etc_plan() light-time handling (lines ~2541-2707).
+   * The Chebyshev polynomials stored in the SE1 files give the planet's
+   * barycentric position at a given time. Apparent position requires the
+   * planet where it was at t - dt (dt = light travel time). For SWIEPH/JPL
+   * we iterate dt via linear extrapolation, then re-read the planet from
+   * the ephemeris file at the refined t - dt for full precision.
+   *
+   * This path handles the main planets (Mercury..Pluto). Asteroids go
+   * through the legacy light-time code below: the asteroid base-position
+   * computation has a separate precision issue where the legacy path
+   * happens to produce results within ~0.1° of swetest, and reworking
+   * that code is out of scope for this fix.
+   */
+  const isMainPlanet = ipli >= SEI_MERCURY && ipli <= SEI_PLUTO;
+  if ((iflag & SEFLG_TRUEPOS) === 0 && isMainPlanet) {
+    const isGeo = (iflag & SEFLG_HELCTR) === 0 && (iflag & SEFLG_BARYCTR) === 0;
+    /* Save initial xx for linear-extrapolation iteration. */
+    const xxSave = new Float64Array(6);
+    for (let i = 0; i <= 5; i++) xxSave[i] = xx[i];
+    /* Iterate dt using linear extrapolation. C uses niter=1 (two passes)
+     * for JPL/SWIEPH, niter=0 (one pass) for Moshier. */
+    const niter = (pedp.iephe === SEFLG_JPLEPH || pedp.iephe === SEFLG_SWIEPH) ? 1 : 0;
+    let dt = 0;
+    for (let j = 0; j <= niter; j++) {
+      dt = Math.sqrt(xx[0] * xx[0] + xx[1] * xx[1] + xx[2] * xx[2]) * LIGHTTIME_AUNIT;
+      for (let i = 0; i <= 2; i++) {
+        xx[i] = xxSave[i] - dt * xxSave[i + 3];
+      }
+    }
+    const t = pedp.teval - dt;
+    /* SWIEPH: re-read planet (and earth/sun) at t - dt for accurate position.
+     * For Moshier we keep the linear extrapolation — a file re-read is not
+     * available, and dt * speed is accurate to better than 0.01" for planets
+     * with small geocentric distance changes over ~10 min of light-time. */
+    if (pedp.iephe === SEFLG_SWIEPH) {
+      const xearth = new Float64Array(6);
+      const xsun = new Float64Array(6);
+      const xplanet = new Float64Array(6);
+      const rc = sweplanSwieph(swed, t, ipli, SEI_FILE_PLANET, iflag,
+        NO_SAVE, xplanet, xearth, xsun, null);
+      if (rc.retc === OK) {
+        /* xplanet is barycentric J2000 at t - dt; re-express in the same
+         * reference center the caller requested, using CURRENT sun/earth as
+         * observer. Aberration (applied below) accounts for the observer's
+         * motion. */
+        for (let i = 0; i <= 5; i++) xx[i] = xplanet[i];
+        if (isGeo) {
+          for (let i = 0; i <= 5; i++) xx[i] -= pedp.x[i];
+        } else if (iflag & SEFLG_HELCTR) {
+          if (!(pdp.iflg & SEI_FLG_HELIO)) {
+            for (let i = 0; i <= 5; i++) xx[i] -= psdp.x[i];
+          }
+        }
+        /* SEFLG_BARYCTR: keep barycentric as-is. */
+      }
+      /* On failure: fall back to the linear-extrapolation result already in xx. */
+    } else if (pedp.iephe === SEFLG_JPLEPH) {
+      /* JPL re-read at t - dt. Keep the linear-extrapolation result on failure. */
+      const jplSerr: string[] = [''];
+      const xplanet = new Float64Array(6);
+      const jplPlanet = PNOINT2JPL[ipli];
+      if (jplPlanet !== undefined) {
+        const retcLt = swiPleph(swed, t, jplPlanet, J_SBARY, xplanet, jplSerr);
+        if (retcLt === OK) {
+          for (let i = 0; i <= 5; i++) xx[i] = xplanet[i];
+          if (isGeo) {
+            for (let i = 0; i <= 5; i++) xx[i] -= pedp.x[i];
+          } else if (iflag & SEFLG_HELCTR) {
+            for (let i = 0; i <= 5; i++) xx[i] -= psdp.x[i];
+          }
+        } else {
+          swiCloseJplFile(swed);
+          swed.jplFileIsOpen = false;
+        }
+      }
+    }
+    /* Moshier: linear extrapolation already applied above. */
+  } else if ((iflag & SEFLG_TRUEPOS) === 0) {
+    /* Legacy path for non-planet bodies (asteroids, etc.). See note above. */
     const dt = Math.sqrt(squareSum(xx)) * LIGHTTIME_AUNIT;
     if (pedp.iephe === SEFLG_JPLEPH || pedp.iephe === SEFLG_SWIEPH) {
-      /* For JPL/SWIEPH: re-read sun/earth at t-dt for proper light-time */
       const t = pedp.teval - dt;
       const dx = new Float64Array(6);
       const xearth = new Float64Array(6);
@@ -1116,20 +1194,12 @@ function appPosEtcPlan(ipl: number, iflag: number, swed: SweData): number {
         } else {
           for (let i = 0; i <= 5; i++) dx[i] = pedp.x[i] - xsun[i];
         }
-        /* recompute geocentric: pdp.x - (new observer) */
-        for (let i = 0; i <= 2; i++) {
-          xx[i] = pdp.x[i] - dx[i];
-        }
-        /* keep speed from stored */
-        for (let i = 3; i <= 5; i++) {
-          xx[i] = pdp.x[i] - dx[i];
-        }
+        for (let i = 0; i <= 2; i++) xx[i] = pdp.x[i] - dx[i];
+        for (let i = 3; i <= 5; i++) xx[i] = pdp.x[i] - dx[i];
       } else {
-        /* fallback: velocity extrapolation */
         for (let i = 0; i <= 2; i++) xx[i] -= dt * xx[i + 3];
       }
     } else {
-      /* Moshier: velocity extrapolation */
       for (let i = 0; i <= 2; i++) xx[i] -= dt * xx[i + 3];
     }
   }
