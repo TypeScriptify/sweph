@@ -1,6 +1,6 @@
 {
     "name": "@typescriptify/sweph",
-    "version": "1.0.3",
+    "version": "1.0.4",
     "description": "Swiss Ephemeris for TypeScript — high-precision astronomical calculations",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",

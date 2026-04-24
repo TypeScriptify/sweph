@@ -1755,8 +1755,22 @@ function lunarOscElem(
     ndp.iephe = iflag & SEFLG_EPHMASK;
     return { retc: OK, serr };
   }
-  const speed_intv = NODE_CALC_INTV_MOSH;
+  /*
+   * Select moon ephemeris: SWIEPH (SE1 moon file) gives tighter precision
+   * than Moshier moon, which is important for the node because the
+   * z/z_dot projection amplifies moon errors ~36×. C lunar_osc_elem()
+   * dispatches on the requested ephemeris (sweph.c:5233-5356). The
+   * previous TS port always used Moshier moon, producing True Node
+   * errors of 1°+ when SWIEPH was otherwise selected.
+   */
+  const epheflag = iflag & SEFLG_EPHMASK;
+  const moonSrcSwieph = (epheflag === SEFLG_SWIEPH)
+    && swed.fidat[SEI_FILE_MOON] !== undefined
+    && swed.fidat[SEI_FILE_MOON].reader !== null;
+  const speed_intv = moonSrcSwieph ? NODE_CALC_INTV : NODE_CALC_INTV_MOSH;
   const istart = (iflag & SEFLG_SPEED) ? 0 : 2;
+  /* Force recomputation of stored moon (may be wrong ephemeris). */
+  swed.pldat[SEI_MOON].teval = 0;
   /*
    * Compute moon at 3 times (t-dt, t+dt, t), transform each to ecliptic of date.
    * xpos[i] will be geocentric ecliptic of date with speed.
@@ -1767,8 +1781,20 @@ function lunarOscElem(
     if (i === 0) t = tjd - speed_intv;
     else if (i === 1) t = tjd + speed_intv;
     else t = tjd;
-    const retc = swiMoshmoon(swed, t, NO_SAVE, xpos[i]);
-    if (retc === ERR) return { retc: ERR, serr: 'error computing Moshier moon' };
+    if (moonSrcSwieph) {
+      const rc = swemoonSwieph(swed, t, iflag | SEFLG_SPEED, NO_SAVE, xpos[i]);
+      if (rc.retc === ERR) return { retc: ERR, serr: rc.serr || 'error computing SWIEPH moon' };
+      if (rc.retc === OK && (iflag & SEFLG_TRUEPOS) === 0) {
+        /* Light-time correction for apparent node (~ 0.006" on node). */
+        const dt = Math.sqrt(xpos[i][0] * xpos[i][0] + xpos[i][1] * xpos[i][1] + xpos[i][2] * xpos[i][2])
+          * LIGHTTIME_AUNIT;
+        const rc2 = swemoonSwieph(swed, t - dt, iflag | SEFLG_SPEED, NO_SAVE, xpos[i]);
+        if (rc2.retc === ERR) return { retc: ERR, serr: rc2.serr || 'error computing SWIEPH moon' };
+      }
+    } else {
+      const retc = swiMoshmoon(swed, t, NO_SAVE, xpos[i]);
+      if (retc === ERR) return { retc: ERR, serr: 'error computing Moshier moon' };
+    }
     /* Apply swi_plan_for_osc_elem equivalent: equatorial J2000 → ecliptic of date */
     planForOscElemTransform(xpos[i], t, iflag | SEFLG_SPEED, swed);
   }
@@ -3404,7 +3430,10 @@ function swemoonSwieph(
     }
   }
   if (xpret !== null) {
-    for (let i = 0; i <= 5; i++) xpret[i] = pdp.x[i];
+    /* When doSave is false, sweph() wrote to the local xp buffer, not pdp.x;
+     * the previous code unconditionally copied pdp.x, returning stale data. */
+    const src = doSave ? pdp.x : xp;
+    for (let i = 0; i <= 5; i++) xpret[i] = src[i];
   }
   return { retc: OK, serr: '' };
 }
